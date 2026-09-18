@@ -39,7 +39,7 @@ NekroAgent 插件：调用火山方舟「声音复刻（Voice Clone）」能力�
 2. **完全重启 NekroAgent**（插件配置与沙箱方法在启动时注册）。
 3. NekroAgent WebUI → 插件 → 「豆包声音复刻语音插件」→ 配置：
    - 必填 **API Key**（火山方舟通用 Key，需已开通声音复刻资源）；
-   - 按需修改 **默认克隆音色 ID**（默认示例值 `S_Fo3GZ6wc2`，请换成你自己训练得到的音色）。
+   - 按需修改 **默认克隆音色 ID**（默认值为占位示例 `S_xxxxxxxx`，请替换为你在火山方舟训练得到的音色）。
 4. 保存后即可使用，无需其他依赖。
 
 ---
@@ -52,7 +52,7 @@ NekroAgent 插件：调用火山方舟「声音复刻（Voice Clone）」能力�
 | `VOICE_CLONE_TTS_URL` | `https://openspeech.bytedance.com/api/v3/tts/unidirectional` | 克隆音色合成地址（POST），可改 |
 | `VOICE_CLONE_RESOURCE_ID` | `seed-icl-2.0` | 克隆音色合成资源 ID |
 | `VOICE_CLONE_API_KEY` | 空 | 复刻专用 Key，留空则复用 `API_KEY` |
-| `CLONE_DEFAULT_SPEAKER` | `S_Fo3GZ6wc2` | 默认克隆音色 ID（`S_`/`icl_` 开头）；调用不传 `speaker_id` 时使用 |
+| `CLONE_DEFAULT_SPEAKER` | `S_xxxxxxxx`（占位） | 默认克隆音色 ID（`S_`/`icl_` 开头）；调用不传 `speaker_id` 时使用，**必须替换为自己的音色** |
 | `VOICE_TRIGGER_PROBABILITY` | `0.3` | 每次对话以该概率向 LLM 注入语音提示（0~1，0 关闭） |
 | `VOICE_TRIGGER_PROMPT` | 内置提示词 | 命中概率时注入的语音提示，措辞可自定义 |
 | `VOICE_TRIGGER_MAX_INPUT_LENGTH` | `100` | 用户消息超过该长度则不触发语音（防长消息高消耗）；0 表示不限制 |

@@ -9,7 +9,7 @@
 `https://openspeech.bytedance.com/api/v3/tts/unidirectional` + `X-Api-Resource-Id: seed-icl-2.0`
 合成语音，再作为 `record` 语音消息发送。
 - 沙箱方法：`send_voice_clone(chat_key, text, speaker_id="")`
-  （`speaker_id` 留空时使用配置项 `CLONE_DEFAULT_SPEAKER` 指定的默认音色，如 `S_Fo3GZ6wc2`，
+  （`speaker_id` 留空时使用配置项 `CLONE_DEFAULT_SPEAKER` 指定的默认音色（占位默认值，须替换为自己的音色），
   因此 LLM 只需调用 `send_voice_clone(chat_key, text)` 即可用已训练音色发声）
 
 > 注：音色训练不在本插件范围内，请在火山方舟控制台（或其他途径）完成声音复刻训练，
@@ -24,7 +24,7 @@
 | VOICE_CLONE_TTS_URL | https://openspeech.bytedance.com/api/v3/tts/unidirectional | 克隆音色合成地址（可改） |
 | VOICE_CLONE_RESOURCE_ID | seed-icl-2.0 | 克隆音色合成资源 ID |
 | VOICE_CLONE_API_KEY | 空（留空则复用 API_KEY） | 复刻专用 Key（如需独立） |
-| CLONE_DEFAULT_SPEAKER | S_Fo3GZ6wc2 | 默认克隆音色 ID（S_/icl_ 开头） |
+| CLONE_DEFAULT_SPEAKER | S_xxxxxxxx（占位） | 默认克隆音色 ID（S_/icl_ 开头），须替换为自己的音色 |
 | AUDIO_FORMAT / SAMPLE_RATE / SPEECH_RATE / LOUDNESS_RATE | ... | 合成音频参数 |
 | MAX_TEXT_LENGTH / REQUEST_TIMEOUT / OUTPUT_DIR / SEND_MODE | ... | 通用参数 |
 | VOICE_TRIGGER_PROBABILITY / VOICE_TRIGGER_PROMPT / VOICE_TRIGGER_MAX_INPUT_LENGTH | ... | 语音概率触发（提示注入） |
@@ -131,14 +131,14 @@ class DoubaoVoiceConfig(ConfigBase):
         ).model_dump(),
     )
     CLONE_DEFAULT_SPEAKER: str = Field(
-        default="S_Fo3GZ6wc2",
+        default="S_xxxxxxxx",
         title="默认克隆音色 ID",
-        description="调用 send_voice_clone 时不传 speaker_id 时使用的默认克隆音色（S_/icl_ 开头）",
+        description="调用 send_voice_clone 时不传 speaker_id 时使用的默认克隆音色（S_/icl_ 开头），须替换为自己在火山方舟训练得到的音色",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="默认克隆音色 ID", en_US="Default Clone Speaker ID"),
             i18n_description=i18n.i18n_text(
-                zh_CN="send_voice_clone 不传 speaker_id 时使用的默认克隆音色",
-                en_US="Default clone speaker used when send_voice_clone omits speaker_id",
+                zh_CN="send_voice_clone 不传 speaker_id 时使用的默认克隆音色，须替换为自己的音色",
+                en_US="Default clone speaker used when send_voice_clone omits speaker_id; replace with your own voice",
             ),
         ).model_dump(),
     )
