@@ -28,6 +28,7 @@
 | AUDIO_FORMAT / SAMPLE_RATE / SPEECH_RATE / LOUDNESS_RATE | ... | 合成音频参数 |
 | MAX_TEXT_LENGTH / REQUEST_TIMEOUT / OUTPUT_DIR / SEND_MODE | ... | 通用参数 |
 | VOICE_TRIGGER_PROBABILITY / VOICE_TRIGGER_PROMPT / VOICE_TRIGGER_MAX_INPUT_LENGTH | ... | 语音概率触发（提示注入） |
+| VOICE_COOLDOWN | 60 | 语音冷却秒数：冷却期内不进行触发概率计算，并拒绝 LLM 的语音请求；0 表示不启用 |
 """
 
 import base64
@@ -179,6 +180,19 @@ class DoubaoVoiceConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="用户消息超过该长度则不触发语音，防止长消息造成高消耗；0=不限",
                 en_US="Suppress voice when user message exceeds this length to avoid cost; 0=unlimited",
+            ),
+        ).model_dump(),
+    )
+    VOICE_COOLDOWN: int = Field(
+        default=60,
+        ge=0,
+        title="语音冷却（秒）",
+        description="发送语音后进入冷却：冷却期内不进行触发概率计算（不注入语音提示），并拒绝 LLM 的语音请求；0 表示不启用冷却",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="语音冷却（秒）", en_US="Voice Cooldown (seconds)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="发送语音后进入冷却：冷却期内不进行概率触发计算，LLM 的语音请求也会被拒绝；0=不启用",
+                en_US="After a voice is sent, probability triggering is suspended and LLM voice requests are rejected during the cooldown; 0=disabled",
             ),
         ).model_dump(),
     )
@@ -364,6 +378,30 @@ async def _send_voice_record(chat_key: str, audio_bytes: bytes, ext: str = "") -
         raise RuntimeError(f"不支持的会话类型: {chat_type}")
 
 
+# ==================== 语音冷却 ====================
+
+# 记录每个频道最近一次语音发送的时间戳，供冷却判断使用：{chat_key: 时间戳}
+_last_voice_time: dict[str, float] = {}
+
+
+def _voice_in_cooldown(chat_key: str) -> bool:
+    """该频道是否处于语音冷却期内。VOICE_COOLDOWN<=0 表示不启用冷却。"""
+    cooldown = max(0, int(config.VOICE_COOLDOWN))
+    if cooldown <= 0:
+        return False
+    last = _last_voice_time.get(chat_key, 0.0)
+    return (time.time() - last) < cooldown
+
+
+def _voice_cooldown_remaining(chat_key: str) -> int:
+    """返回剩余冷却秒数（向上取整）；未在冷却中返回 0。"""
+    cooldown = max(0, int(config.VOICE_COOLDOWN))
+    if cooldown <= 0:
+        return 0
+    remaining = cooldown - (time.time() - _last_voice_time.get(chat_key, 0.0))
+    return max(0, int(remaining) + (1 if remaining % 1 else 0))
+
+
 # ==================== 沙箱方法 ====================
 
 @plugin.mount_sandbox_method(SandboxMethodType.TOOL, "发送克隆音色语音")
@@ -372,6 +410,7 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
 
     不传 speaker_id 时使用配置项 CLONE_DEFAULT_SPEAKER 指定的默认克隆音色，
     LLM 只需调用 send_voice_clone(chat_key, text) 即可用已训练音色发声。
+    语音冷却期内（VOICE_COOLDOWN）调用会被直接拒绝，不进行合成。
 
     Args:
         chat_key (str): 聊天的唯一标识符，形如 "onebot_v11-group_123456"
@@ -382,6 +421,11 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
     Returns:
         bool: 操作是否成功
     """
+    if _voice_in_cooldown(chat_key):
+        core.logger.info(
+            f"[{chat_key}] 语音冷却中（剩余 {_voice_cooldown_remaining(chat_key)} 秒），已拒绝本次语音请求"
+        )
+        return False
     speaker_id = (speaker_id or config.CLONE_DEFAULT_SPEAKER).strip()
     if not text or not text.strip() or not speaker_id:
         core.logger.error(f"[{chat_key}] 文本或克隆音色为空，已忽略")
@@ -389,11 +433,13 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
     try:
         audio_bytes = await _synthesize_voice_clone(text.strip(), speaker_id)
         await _send_voice_record(chat_key, audio_bytes)
-        core.logger.info(f"[{chat_key}] 克隆音色 {speaker_id} 合成并发送成功 (内容: {text.strip()[:50]})")
     except Exception as e:
         core.logger.error(f"[{chat_key}] 克隆音色合成/发送失败: {e}")
         return False
     else:
+        # 仅在语音实际发送成功后进入冷却
+        _last_voice_time[chat_key] = time.time()
+        core.logger.info(f"[{chat_key}] 克隆音色 {speaker_id} 合成并发送成功 (内容: {text.strip()[:50]})")
         return True
 
 
@@ -415,8 +461,11 @@ async def _record_input_len(_ctx: AgentCtx, message: ChatMessage) -> MsgSignal:
     description="以配置的概率向 LLM 注入语音提示，引导其偶尔用克隆音色语音回复",
 )
 async def voice_trigger_inject(_ctx: AgentCtx) -> str:
-    """按 VOICE_TRIGGER_PROBABILITY 概率返回语音提示；未命中或输入过长返回空串。"""
+    """按 VOICE_TRIGGER_PROBABILITY 概率返回语音提示；未命中、输入过长或冷却期内返回空串。"""
     if config.VOICE_TRIGGER_PROBABILITY <= 0:
+        return ""
+    # 冷却期内不进行触发概率计算，不注入语音提示
+    if _voice_in_cooldown(_ctx.chat_key):
         return ""
     # 用户消息过长时不触发语音，防止长内容合成造成高消耗
     max_len = config.VOICE_TRIGGER_MAX_INPUT_LENGTH
