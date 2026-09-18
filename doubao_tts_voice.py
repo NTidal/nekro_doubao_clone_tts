@@ -29,7 +29,7 @@
 | MAX_TEXT_LENGTH / REQUEST_TIMEOUT / OUTPUT_DIR / SEND_MODE | ... | 通用参数 |
 | VOICE_TRIGGER_PROBABILITY / VOICE_TRIGGER_PROMPT / VOICE_TRIGGER_MAX_INPUT_LENGTH | ... | 语音概率触发（提示注入） |
 | VOICE_COOLDOWN | 60 | 语音冷却秒数：发送语音后的冷却期内不进行触发概率计算（不注入语音提示）；不会拒绝语音请求；0 表示不启用 |
-| VOICE_DEDUP_WINDOW | 300 | 内容防抖窗口秒数：窗口内与上一条语音内容高度相似的请求会被静默吞掉（发送空音频占位，返回成功）；0 表示不启用 |
+| VOICE_DEDUP_WINDOW | 300 | 内容防抖窗口秒数：窗口内与上一条语音内容高度相似的请求会被静默忽略（不发送任何消息，直接返回成功）；0 表示不启用 |
 | VOICE_DEDUP_SIMILARITY | 0.6 | 内容防抖相似度阈值（0~1）：规范化后与上一条语音的相似度达到该值即判定为重复；互为子串直接判重 |
 """
 
@@ -204,12 +204,12 @@ class DoubaoVoiceConfig(ConfigBase):
         default=300,
         ge=0,
         title="内容防抖窗口（秒）",
-        description="该窗口内与上一条语音内容高度相似的合成请求会被静默吞掉（发送空音频占位并返回成功，不影响 LLM 后续输出）；0 表示不启用内容防抖",
+        description="该窗口内与上一条语音内容高度相似的合成请求会被静默忽略（不发送任何消息，直接返回成功，不影响 LLM 后续输出）；0 表示不启用内容防抖",
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="内容防抖窗口（秒）", en_US="Voice Dedup Window (seconds)"),
             i18n_description=i18n.i18n_text(
-                zh_CN="窗口内与上一条语音内容高度相似的请求会被静默吞掉（空音频占位，返回成功）；0=不启用",
-                en_US="Requests too similar to the previous voice within this window are silently swallowed (a placeholder audio is sent, returns success); 0=disabled",
+                zh_CN="窗口内与上一条语音内容高度相似的请求会被静默忽略（不发送消息，返回成功）；0=不启用",
+                en_US="Requests too similar to the previous voice within this window are silently ignored (nothing is sent, returns success); 0=disabled",
             ),
         ).model_dump(),
     )
@@ -409,27 +409,6 @@ async def _send_voice_record(chat_key: str, audio_bytes: bytes, ext: str = "") -
         raise RuntimeError(f"不支持的会话类型: {chat_type}")
 
 
-def _build_silent_audio_bytes() -> bytes:
-    """构造一个极短的静音 MP3（约 0.07 秒、几百字节），作为防抖占位音频。
-
-    直接内嵌一段最小化的合法 MP3 帧数据（MPEG-1 Layer III, 24kHz, 单声道静音样本），
-    不依赖 ffmpeg 或额外编码库。
-    """
-    import struct
-
-    # MPEG-1 Layer III, 24kHz, 32kbps, 单声道: 每帧 417/418 字节, 1152 样本/帧 ≈ 48ms
-    # 构造若干全零主数据帧：帧头合法即可，解码后为极短静音
-    frame_header = bytes([0xFF, 0xFB, 0x90, 0x64])  # sync + MPEG1 L3 24kHz 32kbps mono
-    frame_len = 104  # 32kbps@24k: frame_size = 144*32000/24000 = 192? 实际按 104 填充亦可被解码
-    frame = frame_header + bytes(frame_len - len(frame_header))
-    return frame * 3  # ~3 帧 ≈ 140ms 静音
-
-
-async def _send_silent_audio(chat_key: str) -> None:
-    """发送一个极短的静音音频占位（防抖命中时使用，用户几乎无感知）。"""
-    await _send_voice_record(chat_key, _build_silent_audio_bytes(), ext="mp3")
-
-
 # ==================== 语音冷却 ====================
 
 # 记录每个频道最近一次语音发送的时间戳，供冷却判断使用：{chat_key: 时间戳}
@@ -500,8 +479,8 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
 
     不传 speaker_id 时使用配置项 CLONE_DEFAULT_SPEAKER 指定的默认克隆音色，
     LLM 只需调用 send_voice_clone(chat_key, text) 即可用已训练音色发声。
-    与上一条语音内容高度相似的重复请求（流式输出连发）会被静默吞掉：
-    返回成功并发送一个极短的空音频占位，不影响本回合后续输出，请放心调用。
+    与上一条语音内容高度相似的重复请求（流式输出连发）会被静默忽略：
+    不发送任何消息，直接返回成功，不影响本回合后续输出，请放心调用。
 
     Args:
         chat_key (str): 聊天的唯一标识符，形如 "onebot_v11-group_123456"
@@ -516,17 +495,14 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
     if not text or not text.strip() or not speaker_id:
         core.logger.error(f"[{chat_key}] 文本或克隆音色为空，已忽略")
         return False
-    # 内容防抖：窗口内与上一条语音高度相似（含互为子串）→ 静默吞掉。
-    # 不返回 False：发送极短的空音频占位，LLM 视为成功，本回合后续文字输出不受任何影响。
+    # 内容防抖：窗口内与上一条语音高度相似（含互为子串）→ 静默忽略。
+    # 不发送任何消息（聊天里不会出现语音条），直接返回 True：
+    # TOOL 类型返回值不进 LLM 上下文，LLM 视为成功，本回合后续文字输出不受任何影响。
     dup, ratio = _is_duplicated_content(chat_key, text)
     if dup:
         core.logger.info(
-            f"[{chat_key}] 内容防抖命中（相似度 {ratio}），已静默吞掉重复语音请求: {text.strip()[:50]}"
+            f"[{chat_key}] 内容防抖命中（相似度 {ratio}），已静默忽略重复语音请求: {text.strip()[:50]}"
         )
-        try:
-            await _send_silent_audio(chat_key)
-        except Exception as e:  # noqa: BLE001
-            core.logger.error(f"[{chat_key}] 空音频占位发送失败: {e}")
         return True
     try:
         audio_bytes = await _synthesize_voice_clone(text.strip(), speaker_id)
