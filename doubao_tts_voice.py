@@ -29,14 +29,18 @@
 | MAX_TEXT_LENGTH / REQUEST_TIMEOUT / OUTPUT_DIR / SEND_MODE | ... | 通用参数 |
 | VOICE_TRIGGER_PROBABILITY / VOICE_TRIGGER_PROMPT / VOICE_TRIGGER_MAX_INPUT_LENGTH | ... | 语音概率触发（提示注入） |
 | VOICE_COOLDOWN | 60 | 语音冷却秒数：冷却期内不进行触发概率计算，并拒绝 LLM 的语音请求；0 表示不启用 |
+| VOICE_DEDUP_WINDOW | 300 | 内容防抖窗口秒数：窗口内与上一条语音内容高度相似的请求会被拒绝；0 表示不启用 |
+| VOICE_DEDUP_SIMILARITY | 0.6 | 内容防抖相似度阈值（0~1）：规范化后与上一条语音的相似度达到该值即判定为重复 |
 """
 
 import base64
 import json
 import pathlib
 import random
+import re
 import time
 import uuid
+from difflib import SequenceMatcher
 from typing import Literal
 
 import httpx
@@ -193,6 +197,33 @@ class DoubaoVoiceConfig(ConfigBase):
             i18n_description=i18n.i18n_text(
                 zh_CN="发送语音后进入冷却：冷却期内不进行概率触发计算，LLM 的语音请求也会被拒绝；0=不启用",
                 en_US="After a voice is sent, probability triggering is suspended and LLM voice requests are rejected during the cooldown; 0=disabled",
+            ),
+        ).model_dump(),
+    )
+    VOICE_DEDUP_WINDOW: int = Field(
+        default=300,
+        ge=0,
+        title="内容防抖窗口（秒）",
+        description="该窗口内与上一条语音内容高度相似的合成请求会被拒绝（防 LLM 流式输出连发两条相近语音）；0 表示不启用内容防抖",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="内容防抖窗口（秒）", en_US="Voice Dedup Window (seconds)"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="窗口内与上一条语音内容高度相似的请求会被拒绝；0=不启用",
+                en_US="Requests too similar to the previous voice within this window are rejected; 0=disabled",
+            ),
+        ).model_dump(),
+    )
+    VOICE_DEDUP_SIMILARITY: float = Field(
+        default=0.6,
+        ge=0.0,
+        le=1.0,
+        title="内容防抖相似度阈值",
+        description="文本规范化（去标点/空白、转小写）后与上一条语音的相似度达到该值即判定为重复并拒绝",
+        json_schema_extra=ExtraField(
+            i18n_title=i18n.i18n_text(zh_CN="内容防抖相似度阈值", en_US="Voice Dedup Similarity Threshold"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="规范化后与上一条语音相似度达到该值即拒绝；0~1，越低越严格",
+                en_US="Reject when normalized similarity with the previous voice reaches this ratio; 0~1, lower is stricter",
             ),
         ).model_dump(),
     )
@@ -402,6 +433,50 @@ def _voice_cooldown_remaining(chat_key: str) -> int:
     return max(0, int(remaining) + (1 if remaining % 1 else 0))
 
 
+# ==================== 内容防抖 ====================
+
+# 记录每个频道上一条已发送语音的（规范化文本, 时间戳），供内容防抖使用
+_last_voice_text: dict[str, tuple[str, float]] = {}
+
+# 规范化时剔除的字符：标点、空白、常见装饰符号
+_DEDUP_STRIP_RE = re.compile(r"[\s，。？！、~…·,.!?\-—:：;；「」『』“”\"'（）()@＠\[\]{}<>《》]+")
+# 叠词/语气后缀，对相似度判定贡献极小，规范化时剔除
+_DEDUP_TAIL_RE = re.compile(r"(呀|啊|啦|咯|哟|呦|喔|哦|呢|吗|吧|哈|呗|嘞|酶|捏|喵|滴|的说|一下)+$")
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """文本规范化：剔除标点/空白/装饰符号、去叠词语气尾、转小写，仅保留对内容有区分度的部分。"""
+    t = _DEDUP_STRIP_RE.sub("", text)
+    t = _DEDUP_TAIL_RE.sub("", t)
+    return t.lower()
+
+
+def _is_duplicated_content(chat_key: str, text: str) -> tuple[bool, float]:
+    """判断是否与窗口内的上一条语音内容高度相似。
+
+    返回 (是否重复, 相似度)。VOICE_DEDUP_WINDOW<=0 时不启用，恒为 False。
+    """
+    window = max(0, int(config.VOICE_DEDUP_WINDOW))
+    if window <= 0:
+        return False, 0.0
+    record = _last_voice_text.get(chat_key)
+    if not record:
+        return False, 0.0
+    last_norm, ts = record
+    if not last_norm or (time.time() - ts) >= window:
+        return False, 0.0
+    new_norm = _normalize_for_dedup(text)
+    if not new_norm or not last_norm:
+        return False, 0.0
+    # 短文本包含判定：一条是另一条的子串（含相等）视为重复，
+    # 处理"流式输出先发半句、再发全句"这类场景（SequenceMatcher 对长短差异不敏感）
+    if new_norm in last_norm or last_norm in new_norm:
+        return True, 1.0
+    ratio = SequenceMatcher(None, last_norm, new_norm).ratio()
+    threshold = min(1.0, max(0.0, float(config.VOICE_DEDUP_SIMILARITY)))
+    return ratio >= threshold, round(ratio, 3)
+
+
 # ==================== 沙箱方法 ====================
 
 @plugin.mount_sandbox_method(SandboxMethodType.TOOL, "发送克隆音色语音")
@@ -410,7 +485,8 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
 
     不传 speaker_id 时使用配置项 CLONE_DEFAULT_SPEAKER 指定的默认克隆音色，
     LLM 只需调用 send_voice_clone(chat_key, text) 即可用已训练音色发声。
-    语音冷却期内（VOICE_COOLDOWN）调用会被直接拒绝，不进行合成。
+    语音冷却期（VOICE_COOLDOWN）内调用会被直接拒绝；与上一条语音内容高度相似
+    的请求（VOICE_DEDUP_WINDOW/VOICE_DEDUP_SIMILARITY）也会被拒绝，请勿重复发送相近内容。
 
     Args:
         chat_key (str): 聊天的唯一标识符，形如 "onebot_v11-group_123456"
@@ -430,6 +506,13 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
     if not text or not text.strip() or not speaker_id:
         core.logger.error(f"[{chat_key}] 文本或克隆音色为空，已忽略")
         return False
+    # 内容防抖：窗口内与上一条语音高度相似（含互为子串）则拒绝，防 LLM 流式输出连发相近语音
+    dup, ratio = _is_duplicated_content(chat_key, text)
+    if dup:
+        core.logger.info(
+            f"[{chat_key}] 内容防抖命中（相似度 {ratio}），已拒绝与上一条语音相近的请求: {text.strip()[:50]}"
+        )
+        return False
     try:
         audio_bytes = await _synthesize_voice_clone(text.strip(), speaker_id)
         await _send_voice_record(chat_key, audio_bytes)
@@ -437,8 +520,9 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
         core.logger.error(f"[{chat_key}] 克隆音色合成/发送失败: {e}")
         return False
     else:
-        # 仅在语音实际发送成功后进入冷却
+        # 仅在语音实际发送成功后进入冷却并记录内容快照
         _last_voice_time[chat_key] = time.time()
+        _last_voice_text[chat_key] = (_normalize_for_dedup(text.strip()), time.time())
         core.logger.info(f"[{chat_key}] 克隆音色 {speaker_id} 合成并发送成功 (内容: {text.strip()[:50]})")
         return True
 
