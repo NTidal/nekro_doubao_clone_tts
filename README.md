@@ -56,6 +56,7 @@ NekroAgent 插件：调用火山方舟「声音复刻（Voice Clone）」能力�
 | `VOICE_TRIGGER_PROBABILITY` | `0.3` | 每次对话以该概率向 LLM 注入语音提示（0~1，0 关闭） |
 | `VOICE_TRIGGER_PROMPT` | 内置提示词 | 命中概率时注入的语音提示，措辞可自定义 |
 | `VOICE_TRIGGER_MAX_INPUT_LENGTH` | `100` | 用户消息超过该长度则不触发语音（防长消息高消耗）；0 表示不限制 |
+| `VOICE_COOLDOWN` | `60` | 语音冷却（秒）：发送语音后进入冷却，冷却期内**不进行触发概率计算**（不注入语音提示），且**拒绝 LLM 的语音请求**（直接返回失败）；0 表示不启用 |
 | `AUDIO_FORMAT` | `mp3` | 音频格式：`mp3` / `ogg_opus` / `pcm` |
 | `SAMPLE_RATE` | `24000` | 采样率：8000 / 16000 / 22050 / 24000 / 32000 / 44100 / 48000 |
 | `SPEECH_RATE` | `0` | 语速 [-50, 100]：100 = 2.0 倍速，-50 = 0.5 倍速 |
@@ -89,6 +90,15 @@ send_voice_clone(chat_key, text, speaker_id="")
 引导模型在该轮用克隆音色语音回复；用户消息超过 `VOICE_TRIGGER_MAX_INPUT_LENGTH` 时自动跳过。
 不需要随机语音时把概率设为 `0`，模型仍可在判断合适时主动调用 `send_voice_clone`。
 
+**语音冷却**
+
+发送语音成功后该频道进入 `VOICE_COOLDOWN`（秒）冷却期：
+
+- 冷却期内**不进行触发概率计算**——即使命中概率也不注入语音提示；
+- 冷却期内 LLM 调用 `send_voice_clone` 会被**直接拒绝**（不合成、不发送，返回失败并记录日志）；
+- 冷却按频道（`chat_key`）独立计算，且**仅在实际发送成功后**才计时；
+- 设为 `0` 关闭冷却。
+
 ---
 
 ## 常见问题
@@ -106,7 +116,11 @@ send_voice_clone(chat_key, text, speaker_id="")
 
 **语音触发太频繁 / 从不触发**
 调整 `VOICE_TRIGGER_PROBABILITY`（0~1）；同时注意 `VOICE_TRIGGER_MAX_INPUT_LENGTH` 的抑制逻辑，
-长消息场景默认不发语音。
+长消息场景默认不发语音。若刚发过语音后一段时间内不再触发，属 `VOICE_COOLDOWN` 冷却正常行为。
+
+**LLM 调用 send_voice_clone 返回 False**
+除文本/音色为空、合成接口报错外，语音冷却期内也会直接拒绝（日志有「语音冷却中」记录），
+可等待冷却结束或调小 `VOICE_COOLDOWN`。
 
 **音色 ID 从哪里获得**
 在火山方舟控制台完成声音复刻训练后获得（`S_` / `icl_` 开头）。训练流程不属于本插件范围。
