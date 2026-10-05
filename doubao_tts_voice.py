@@ -2,15 +2,27 @@
 # 豆包声音复刻语音插件(nekro_doubao_clone_tts)
 # 火山方舟声音复刻（Voice Clone）语音合成
 
-本插件仅提供「用已训练好的克隆音色合成语音并发送」的能力，通过 OneBot V11 发送语音消息。
+本插件仅提供「用已训练好的克隆音色合成语音并发送」的能力，支持 OneBot V11 与 QQ 官方机器人（qqbot_openclaw）两种渠道。
 
 ## 声音复刻语音合成
 使用事先训练好的 `S_`/`icl_` 克隆音色，通过通用 ICL 合成端点
 `https://openspeech.bytedance.com/api/v3/tts/unidirectional` + `X-Api-Resource-Id: seed-icl-2.0`
-合成语音，再作为 `record` 语音消息发送。
+合成语音，再作为语音消息发送。
 - 沙箱方法：`send_voice_clone(chat_key, text, speaker_id="")`
   （`speaker_id` 留空时使用配置项 `CLONE_DEFAULT_SPEAKER` 指定的默认音色（占位默认值，须替换为自己的音色），
   因此 LLM 只需调用 `send_voice_clone(chat_key, text)` 即可用已训练音色发声）
+
+## 渠道差异（重要）
+
+| 渠道 | 发送方式 | 音频格式要求 |
+|------|----------|--------------|
+| `onebot_v11` | `record` 段（`send_group_msg` / `send_private_msg`） | 由协议端自动转 silk；mp3 亦可 |
+| `qqbot_openclaw` | 落盘为音频文件 → 走 FILE 段 → 适配器按后缀判定 `file_type=3` → 官方分片上传 + `msg_type=7` | **不要用 pcm**：`.pcm` 不在适配器音频后缀白名单，会被当成文件发送。推荐 `mp3`（24k/48k 实测均可） |
+
+> QQ 官方渠道实测（群聊场景）：mp3 / wav / flac / m4a / ogg / amr / aac 均被平台接受并显示为语音条；
+> `.silk` 必须带腾讯特有的 `0x02` 前缀（即 `pilk.encode(..., tencent=True)`），
+> 缺少该前缀的裸 silk 会被平台以 `850019 富媒体文件格式不支持` 拒收。
+> 平台校验的是**文件内容魔数**，与扩展名无关。
 
 > 注：音色训练不在本插件范围内，请在火山方舟控制台（或其他途径）完成声音复刻训练，
 > 得到 `S_`/`icl_` 音色 ID 后填入配置或调用时传入。
@@ -46,7 +58,6 @@ from typing import Literal
 import httpx
 from pydantic import Field
 
-from nekro_agent.adapters.onebot_v11.core.bot import get_bot
 from nekro_agent.api import core, i18n
 from nekro_agent.api.plugin import (
     ConfigBase,
@@ -65,11 +76,11 @@ DEFAULT_VOICE_CLONE_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidi
 plugin = NekroPlugin(
     name="豆包声音复刻语音插件",
     module_name="doubao_tts_voice",
-    description="火山方舟声音复刻（Voice Clone）语音合成，用已训练的克隆音色把文本合成为语音并经 OneBot V11 发送",
-    version="1.0",
+    description="火山方舟声音复刻（Voice Clone）语音合成，用已训练的克隆音色把文本合成为语音，支持 OneBot V11 与 QQ 官方机器人发送",
+    version="1.1",
     author="NTidal",
     url="https://github.com/NTidal/nekro_doubao_clone_tts",
-    support_adapter=["onebot_v11"],
+    support_adapter=["onebot_v11", "qqbot_openclaw"],
     i18n_name=i18n.i18n_text(
         zh_CN="豆包声音复刻语音插件",
         en_US="Doubao Voice Clone Plugin",
@@ -231,8 +242,17 @@ class DoubaoVoiceConfig(ConfigBase):
     AUDIO_FORMAT: Literal["mp3", "ogg_opus", "pcm"] = Field(
         default="mp3",
         title="音频格式",
+        description=(
+            "OneBot V11 下三种均可（协议端会自动转 silk）。"
+            "QQ 官方机器人（qqbot_openclaw）下请用 mp3："
+            "pcm 不在官方渠道音频后缀白名单，会被当成文件发送而非语音条。"
+        ),
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="音频格式", en_US="Audio Format"),
+            i18n_description=i18n.i18n_text(
+                zh_CN="OneBot V11 下三种均可；QQ 官方机器人请用 mp3（pcm 会被当成文件发送）",
+                en_US="All three work on OneBot V11; use mp3 for the official QQ bot (pcm is sent as a file)",
+            ),
         ).model_dump(),
     )
     SAMPLE_RATE: int = Field(
@@ -290,7 +310,10 @@ class DoubaoVoiceConfig(ConfigBase):
     SEND_MODE: Literal["base64", "file"] = Field(
         default="base64",
         title="发送方式",
-        description="base64: 内嵌音频数据，跨机器最稳；file: 使用本地文件路径（需与协议端共享文件系统）",
+        description=(
+            "base64: 内嵌音频数据，跨机器最稳；file: 使用本地文件路径（需与协议端共享文件系统）。"
+            "仅对 OneBot V11 生效；QQ 官方机器人固定走文件上传流程，忽略此项。"
+        ),
         json_schema_extra=ExtraField(
             i18n_title=i18n.i18n_text(zh_CN="发送方式", en_US="Send Mode"),
             i18n_description=i18n.i18n_text(
@@ -380,9 +403,18 @@ async def _synthesize_voice_clone(text: str, speaker_id: str) -> bytes:
     )
 
 
-async def _send_voice_record(chat_key: str, audio_bytes: bytes, ext: str = "") -> None:
+# 音频格式 -> 文件名后缀。QQ 官方渠道靠后缀推断媒体类型（file_type=3 语音）。
+_FORMAT_SUFFIX = {"mp3": ".mp3", "ogg_opus": ".ogg", "pcm": ".pcm", "wav": ".wav"}
+# QQ 官方渠道（qqbot_openclaw）能识别为「语音」的后缀：
+#   .mp3 / .wav / .flac / .m4a / .ogg / .amr / .aac  → file_type=3
+#   .pcm 不在白名单内 → 会被判成 file_type=4（文件），故需显式拒绝并提示。
+_QQBOT_VOICE_SUFFIXES = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".amr", ".aac", ".silk"}
+
+
+async def _send_voice_onebot_v11(chat_key: str, audio_bytes: bytes, ext: str = "") -> None:
     """将音频作为 OneBot V11 语音（record）发送到群聊或私聊。"""
     from nonebot.adapters.onebot.v11 import MessageSegment
+    from nekro_agent.adapters.onebot_v11.core.bot import get_bot
 
     db_chat_channel: DBChatChannel = await DBChatChannel.get_channel(chat_key=chat_key)
     chat_type = db_chat_channel.chat_type
@@ -407,6 +439,52 @@ async def _send_voice_record(chat_key: str, audio_bytes: bytes, ext: str = "") -
         await get_bot().call_api("send_private_msg", user_id=user_id, message=[segment])
     else:
         raise RuntimeError(f"不支持的会话类型: {chat_type}")
+
+
+async def _send_voice_qqbot_openclaw(_ctx: AgentCtx, audio_bytes: bytes, ext: str = "") -> None:
+    """将音频通过 QQ 官方机器人（qqbot_openclaw）发送为语音条。
+
+    官方渠道没有 OneBot 的 record 段，语音属于「富媒体」：
+    适配器会按文件后缀推断媒体类型（audio 类后缀 → file_type=3），
+    先走分片上传拿 file_info，再用 msg_type=7 发送。
+    因此这里只需把音频落盘成一个带正确后缀的文件，再走标准 FILE 段即可。
+
+    实测（群聊场景）：
+      .mp3(24k/48k)、.wav、.flac、.m4a、.ogg、.amr、.aac 均被平台接受；
+      .silk 必须带腾讯 0x02 前缀（pilk tencent=True），否则 850019 拒收；
+      .pcm 不在音频后缀白名单，会被当成文件而非语音。
+    """
+    from nekro_agent.api.message import send_file
+
+    suffix = _FORMAT_SUFFIX.get(ext or config.AUDIO_FORMAT, f".{ext or config.AUDIO_FORMAT}")
+    if suffix not in _QQBOT_VOICE_SUFFIXES:
+        raise RuntimeError(
+            f"QQ 官方渠道不支持音频格式 {suffix} 作为语音发送"
+            f"（该后缀会被平台识别为文件而非语音条）。"
+            f"请将 AUDIO_FORMAT 设为 mp3 或 ogg_opus（当前配置：{config.AUDIO_FORMAT}）。"
+        )
+
+    file_name = f"voice_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}{suffix}"
+    # mixed_forward_file 会写入 uploads 目录并返回沙盒路径，
+    # 适配器随后经 convert_to_host_path 映射回宿主机路径读取。
+    sandbox_path = await _ctx.fs.mixed_forward_file(audio_bytes, file_name=file_name)
+    await send_file(_ctx.chat_key, sandbox_path, _ctx)
+
+
+async def _send_voice_record(_ctx: AgentCtx, chat_key: str, audio_bytes: bytes, ext: str = "") -> None:
+    """按当前适配器分派语音发送。"""
+    adapter_key = _ctx.adapter_key or ""
+    if not adapter_key:
+        db_chat_channel: DBChatChannel = await DBChatChannel.get_channel(chat_key=chat_key)
+        adapter_key = db_chat_channel.adapter_key
+
+    if adapter_key == "qqbot_openclaw":
+        await _send_voice_qqbot_openclaw(_ctx, audio_bytes, ext)
+        return
+    if adapter_key == "onebot_v11":
+        await _send_voice_onebot_v11(chat_key, audio_bytes, ext)
+        return
+    raise RuntimeError(f"当前适配器 {adapter_key!r} 暂不支持语音发送")
 
 
 # ==================== 语音冷却 ====================
@@ -506,7 +584,7 @@ async def send_voice_clone(_ctx: AgentCtx, chat_key: str, text: str, speaker_id:
         return True
     try:
         audio_bytes = await _synthesize_voice_clone(text.strip(), speaker_id)
-        await _send_voice_record(chat_key, audio_bytes)
+        await _send_voice_record(_ctx, chat_key, audio_bytes)
     except Exception as e:
         core.logger.error(f"[{chat_key}] 克隆音色合成/发送失败: {e}")
         return False

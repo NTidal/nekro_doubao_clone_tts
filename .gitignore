@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.bak_*
+.DS_Store
+Thumbs.db
+Zone.Identifier*
